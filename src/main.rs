@@ -1,4 +1,5 @@
 use libc::{MAP_FAILED, mmap64, munmap};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::num::ParseFloatError;
 use std::os::fd::AsRawFd;
@@ -16,15 +17,6 @@ fn find_next_newline(data: &[u8]) -> Vec<usize> {
     data.iter()
         .enumerate()
         .filter(|&(_, byte)| *byte == b'\n')
-        .map(|(i, _)| i)
-        .take(1)
-        .collect()
-}
-
-fn find_next_semicolon(data: &[u8]) -> Vec<usize> {
-    data.iter()
-        .enumerate()
-        .filter(|&(_, byte)| *byte == b';')
         .map(|(i, _)| i)
         .take(1)
         .collect()
@@ -49,60 +41,77 @@ fn chunker(size: usize, data: &[u8]) -> Vec<(usize, usize)> {
     chunks
 }
 
-fn chunk_processor(data: &[u8], tx: Sender<StationResults>) {
-    let mut station_results = StationResults {
-        sum: 0.0,
-        count: 0,
-        min: ([0u8; 100], f32::INFINITY),
-        max: ([0u8; 100], f32::NEG_INFINITY),
-    };
+fn chunk_processor<'a>(data: &'a [u8], tx: Sender<BTreeMap<&'a str, StationResult<'a>>>) {
+    let mut station_results: BTreeMap<&'a str, StationResult<'a>> = BTreeMap::new();
 
-    let mut min_max_buf = [0u8; 100];
-    let mut station_begin = true;
-    let mut start_float_cursor = 0usize;
-    let mut start_line_cursor = 0usize;
-    let mut semicolon_not_found = true;
+    let mut semicolon_index = 0usize;
+    let mut start_line_index = 0usize;
+    let mut newline_index = 0usize;
 
     for (i, c) in data.iter().enumerate() {
-        if station_begin && semicolon_not_found {
-            min_max_buf[i - start_line_cursor] = *c;
-            if data[i + 1] == b';' {
-                semicolon_not_found = false;
-            }
-        } else if *c == b';' {
-            station_begin = false;
-            start_float_cursor = i + 1;
-        } else if !station_begin && *c == b'\n' {
-            let station_val = bytes_to_float(&data[start_float_cursor..i - 1])
-                .expect("Should be a valid here...");
-            station_results.sum += station_val;
-            station_results.count += 1;
-            if station_val > station_results.max.1 {
-                let mut max0 = station_results.max.0;
-                max0.clone_from_slice(&min_max_buf[..]);
-                let min_max_buf_str = unsafe { str::from_utf8_unchecked(&min_max_buf[..]) };
-                station_results.max.1 = station_val;
-            } else if station_val < station_results.min.1 {
-                let mut min0 = station_results.max.0;
-                min0.clone_from_slice(&min_max_buf[..]);
-                station_results.min.1 = station_val;
-            }
-            min_max_buf.fill(0);
-            station_begin = true; // reset buffers
-            start_float_cursor = 0;
-            start_line_cursor = i + 1;
+        if c == &b';' {
+            semicolon_index = i;
+        } else if c == &b'\n' {
+            newline_index = i;
+            let station_name = byte_2_str(&data[start_line_index..semicolon_index]);
+            start_line_index = i + 1;
+            let station_value =
+                bytes_to_float(&data[semicolon_index + 1..newline_index]).expect("Should be valid");
+
+            station_results
+                .entry(station_name)
+                .and_modify(|e: &mut StationResult<'a>| {
+                    e.count += 1;
+                    e.sum += station_value;
+                    if station_value < e.min {
+                        e.min = station_value;
+                    }
+                    if station_value > e.max {
+                        e.max = station_value;
+                    }
+                })
+                .or_insert(StationResult::new(
+                    station_name,
+                    1,
+                    station_value,
+                    station_value,
+                    station_value,
+                ));
         }
     }
 
     tx.send(station_results).unwrap();
 }
 
+fn byte_2_str<'a>(data: &'a [u8]) -> &'a str {
+    unsafe { str::from_utf8_unchecked(&data) }
+}
+
 #[derive(Debug)]
-struct StationResults {
-    sum: f32,              // sum of vals
-    count: u32,            // num stations
-    min: ([u8; 100], f32), //name, val
-    max: ([u8; 100], f32), //name, val
+struct StationResult<'a> {
+    name: &'a str,
+    count: u32,
+    sum: f32,
+    min: f32,
+    max: f32,
+}
+
+impl<'a> StationResult<'a> {
+    fn new(name: &'a str, count: u32, sum: f32, min: f32, max: f32) -> Self {
+        Self {
+            name,
+            count,
+            sum,
+            min,
+            max,
+        }
+    }
+}
+
+impl<'a> PartialEq for StationResult<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -135,7 +144,7 @@ fn main() -> io::Result<()> {
     let mut handles = vec![];
     let (tx, rx) = channel();
     for chunk in chunks {
-        let tx_clone: Sender<StationResults> = tx.clone();
+        let tx_clone: Sender<BTreeMap<&str, StationResult>> = tx.clone();
         let j_handle = thread::spawn(move || {
             chunk_processor(&data[chunk.0..chunk.1], tx_clone);
         });
@@ -146,26 +155,35 @@ fn main() -> io::Result<()> {
         handle.join().unwrap();
     }
 
-    let mut total_sum = 0f32;
-    let mut mean = 0f32;
-    let mut total_count = 0;
-    let mut max = 0f32;
-    let mut min = 0f32;
-
+    let mut accumulated: BTreeMap<&str, StationResult> = BTreeMap::new();
     for _ in 0..chunks_size {
-        let station = rx.recv().unwrap();
-        total_sum += station.sum;
-        total_count += station.count;
-        if station.max.1 > max {
-            max = station.max.1;
-        }
-        if station.min.1 > min {
-            min = station.min.1;
+        let stations = rx.recv().unwrap();
+        stations_accumulator(&mut accumulated, stations);
+    }
+    dbg!(accumulated.len());
+
+    print!("{{");
+    for (i, result) in accumulated.iter().enumerate() {
+        if i == accumulated.len() - 1 {
+            print!(
+                "{}={:.1}/{}/{}",
+                result.0,
+                result.1.sum / result.1.count as f32, // mean
+                result.1.min,
+                result.1.max
+            );
+        } else {
+            print!(
+                "{}={:.1}/{}/{}, ",
+                result.0,
+                result.1.sum / result.1.count as f32, // mean
+                result.1.min,
+                result.1.max
+            );
         }
     }
-    mean = total_sum / total_count as f32;
-
-    println!("FINAL RESULT: max: {max}; min: {min}; mean: {mean}; sum: {total_sum}");
+    print!("}}");
+    println!();
 
     unsafe {
         if munmap(ptr, size) != 0 {
@@ -174,4 +192,25 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn stations_accumulator<'a, 'b>(
+    accumulated: &'b mut BTreeMap<&'a str, StationResult<'a>>,
+    existing: BTreeMap<&'a str, StationResult<'a>>,
+) {
+    for station in existing {
+        accumulated
+            .entry(station.0)
+            .and_modify(|e| {
+                e.count += station.1.count;
+                e.sum += station.1.sum;
+                if e.max < station.1.max {
+                    e.max = station.1.max;
+                }
+                if e.min > station.1.min {
+                    e.min = station.1.min;
+                }
+            })
+            .or_insert(station.1);
+    }
 }
