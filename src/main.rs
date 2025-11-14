@@ -5,6 +5,7 @@ use std::num::ParseFloatError;
 use std::os::fd::AsRawFd;
 use std::str;
 use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::{f32, io};
 
@@ -155,12 +156,25 @@ fn main() -> io::Result<()> {
         handle.join().unwrap();
     }
 
-    let mut accumulated: BTreeMap<&str, StationResult> = BTreeMap::new();
+    let mut handles = Vec::new();
+
+    let accumulated: Arc<Mutex<BTreeMap<&str, StationResult>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
+
     for _ in 0..chunks_size {
         let stations = rx.recv().unwrap();
-        stations_accumulator(&mut accumulated, stations);
+        let mut accumulated_clone = Arc::clone(&accumulated);
+        let j_handle = std::thread::spawn(move || {
+            stations_accumulator(&mut accumulated_clone, stations);
+        });
+        handles.push(j_handle);
     }
-    dbg!(accumulated.len());
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let accumulated = accumulated.lock().unwrap();
 
     print!("{{");
     for (i, result) in accumulated.iter().enumerate() {
@@ -195,11 +209,12 @@ fn main() -> io::Result<()> {
 }
 
 fn stations_accumulator<'a, 'b>(
-    accumulated: &'b mut BTreeMap<&'a str, StationResult<'a>>,
+    accumulated: &'b mut Arc<Mutex<BTreeMap<&'a str, StationResult<'a>>>>,
     existing: BTreeMap<&'a str, StationResult<'a>>,
 ) {
     for station in existing {
-        accumulated
+        let mut unlocked_accumulated = accumulated.lock().expect("Could not unlock BTree Mutex");
+        unlocked_accumulated
             .entry(station.0)
             .and_modify(|e| {
                 e.count += station.1.count;
